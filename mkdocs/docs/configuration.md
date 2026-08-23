@@ -119,6 +119,12 @@ When a concurrent commit is detected, PyIceberg automatically retries the operat
 | `commit.retry.max-wait-ms`      | Integer (ms)     | 60000     | Maximum wait time between retries (caps exponential backoff)        |
 | `commit.retry.total-timeout-ms` | Integer (ms)     | 1800000   | Total time allowed for all retry attempts before giving up          |
 
+### Delete mode options
+
+| Key                 | Options                          | Default        | Description                                                                                     |
+| ------------------- | -------------------------------- | -------------- | ----------------------------------------------------------------------------------------------- |
+| `write.delete.mode` | `{copy-on-write,merge-on-read}`  | copy-on-write  | How a delete removes rows. Under `copy-on-write`, every data file holding a matched row is rewritten without those rows. Under `merge-on-read`, the data files are left untouched and the matched row positions are written to a position delete file that readers apply, which costs O(rows deleted) instead of O(table). Merge-on-read is only available on v2 tables; v1 and v3 tables fall back to copy-on-write. |
+
 ### Isolation level options
 
 These properties control conflict detection behavior during concurrent writes.

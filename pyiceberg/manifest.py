@@ -775,9 +775,7 @@ MANIFEST_LIST_FILE_SCHEMAS: dict[int, Schema] = {
 MANIFEST_LIST_FILE_STRUCTS = {format_version: schema.as_struct() for format_version, schema in MANIFEST_LIST_FILE_SCHEMAS.items()}
 
 
-POSITIONAL_DELETE_SCHEMA = Schema(
-    NestedField(2147483546, "file_path", StringType()), NestedField(2147483545, "pos", IntegerType())
-)
+POSITIONAL_DELETE_SCHEMA = Schema(NestedField(2147483546, "file_path", StringType()), NestedField(2147483545, "pos", LongType()))
 
 
 class ManifestFile(Record):
@@ -1260,11 +1258,13 @@ class ManifestWriterV2(ManifestWriter):
         output_file: OutputFile,
         snapshot_id: int,
         avro_compression: AvroCompressionCodec,
+        content: ManifestContent = ManifestContent.DATA,
     ):
         super().__init__(spec, schema, output_file, snapshot_id, avro_compression)
+        self._content = content
 
     def content(self) -> ManifestContent:
-        return ManifestContent.DATA
+        return self._content
 
     @property
     def version(self) -> TableVersion:
@@ -1274,7 +1274,7 @@ class ManifestWriterV2(ManifestWriter):
     def _meta(self) -> dict[str, str]:
         return {
             **super()._meta,
-            "content": "data",
+            "content": "deletes" if self._content == ManifestContent.DELETES else "data",
         }
 
     def prepare_entry(self, entry: ManifestEntry) -> ManifestEntry:
@@ -1293,11 +1293,14 @@ def write_manifest(
     output_file: OutputFile,
     snapshot_id: int,
     avro_compression: AvroCompressionCodec,
+    content: ManifestContent = ManifestContent.DATA,
 ) -> ManifestWriter:
     if format_version == 1:
+        if content == ManifestContent.DELETES:
+            raise ValueError("Cannot write delete manifests for a v1 table")
         return ManifestWriterV1(spec, schema, output_file, snapshot_id, avro_compression)
     elif format_version == 2:
-        return ManifestWriterV2(spec, schema, output_file, snapshot_id, avro_compression)
+        return ManifestWriterV2(spec, schema, output_file, snapshot_id, avro_compression, content)
     else:
         raise ValueError(f"Cannot write manifest for table version: {format_version}")
 

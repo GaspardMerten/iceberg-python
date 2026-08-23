@@ -757,13 +757,26 @@ class Transaction:
             case_sensitive: A bool determine if the provided `delete_filter` is case-sensitive
             branch: Branch Reference to run the delete operation
         """
-        from pyiceberg.io.pyarrow import ArrowScan, _dataframe_to_data_files, _expression_to_complementary_pyarrow
+        from pyiceberg.io.pyarrow import (
+            ArrowScan,
+            _dataframe_to_data_files,
+            _expression_to_complementary_pyarrow,
+            _positions_matching_predicate,
+            _write_position_deletes,
+        )
 
-        if (
+        merge_on_read = (
             self.table_metadata.properties.get(TableProperties.DELETE_MODE, TableProperties.DELETE_MODE_DEFAULT)
             == TableProperties.DELETE_MODE_MERGE_ON_READ
-        ):
-            warnings.warn("Merge on read is not yet supported, falling back to copy-on-write", stacklevel=2)
+        )
+        if merge_on_read and self.table_metadata.format_version != 2:
+            # v1 cannot store delete manifests, and v3 encodes the deletes as deletion vectors
+            warnings.warn(
+                f"Merge on read is not yet supported for v{self.table_metadata.format_version} tables, "
+                "falling back to copy-on-write",
+                stacklevel=2,
+            )
+            merge_on_read = False
 
         if isinstance(delete_filter, str):
             delete_filter = _parse_row_filter(delete_filter)
@@ -775,9 +788,6 @@ class Transaction:
 
         # Check if there are any files that require an actual rewrite of a data file
         if delete_snapshot.rewrites_needed is True:
-            bound_delete_filter = bind(self.table_metadata.schema(), delete_filter, case_sensitive)
-            preserve_row_filter = _expression_to_complementary_pyarrow(bound_delete_filter, self.table_metadata.schema())
-
             file_scan = self._scan(row_filter=delete_filter, case_sensitive=case_sensitive)
             if branch is not None:
                 file_scan = file_scan.use_ref(branch)
@@ -785,6 +795,48 @@ class Transaction:
 
             commit_uuid = uuid.uuid4()
             counter = itertools.count(0)
+
+            if merge_on_read:
+                # Rather than rewriting the data files without the matched rows, record the positions
+                # of those rows in a delete file that the read side applies
+                delete_files = []
+                for original_file in files:
+                    positions = _positions_matching_predicate(
+                        io=self._table.io,
+                        table_metadata=self.table_metadata,
+                        data_file=original_file.file,
+                        delete_filter=delete_filter,
+                        case_sensitive=case_sensitive,
+                    )
+                    if len(positions) > 0:
+                        delete_files.append(
+                            _write_position_deletes(
+                                io=self._table.io,
+                                table_metadata=self.table_metadata,
+                                data_file=original_file.file,
+                                positions=positions,
+                                write_uuid=commit_uuid,
+                                counter=counter,
+                            )
+                        )
+
+                if delete_files:
+                    with self.update_snapshot(
+                        snapshot_properties=snapshot_properties, branch=branch
+                    ).overwrite() as overwrite_snapshot:
+                        if _isolation_operation is not None:
+                            overwrite_snapshot._isolation_operation = _isolation_operation
+                        overwrite_snapshot._starting_snapshot_id = delete_snapshot._starting_snapshot_id
+                        overwrite_snapshot.commit_uuid = commit_uuid
+                        # No data file is replaced, the predicate is what makes a concurrent
+                        # rewrite of the data files these deletes point at conflict
+                        overwrite_snapshot.delete_by_predicate(delete_filter, case_sensitive)
+                        for delete_file in delete_files:
+                            overwrite_snapshot.append_delete_file(delete_file)
+                return
+
+            bound_delete_filter = bind(self.table_metadata.schema(), delete_filter, case_sensitive)
+            preserve_row_filter = _expression_to_complementary_pyarrow(bound_delete_filter, self.table_metadata.schema())
 
             replaced_files: list[tuple[DataFile, list[DataFile]]] = []
             # This will load the Parquet file into memory, including:

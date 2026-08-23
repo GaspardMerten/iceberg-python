@@ -135,6 +135,7 @@ class _SnapshotProducer(UpdateTableMetadata[U], Generic[U]):
     _parent_snapshot_id: int | None
     _starting_snapshot_id: int | None
     _added_data_files: list[DataFile]
+    _added_delete_files: list[DataFile]
     _manifest_num_counter: itertools.count[int]
     _deleted_data_files: set[DataFile]
     _compression: AvroCompressionCodec
@@ -162,6 +163,7 @@ class _SnapshotProducer(UpdateTableMetadata[U], Generic[U]):
         self._operation = operation
         self._snapshot_id = self._transaction.table_metadata.new_snapshot_id()
         self._added_data_files = []
+        self._added_delete_files = []
         self._deleted_data_files = set()
         self.snapshot_properties = snapshot_properties
         self._manifest_num_counter = itertools.count(0)
@@ -197,6 +199,10 @@ class _SnapshotProducer(UpdateTableMetadata[U], Generic[U]):
 
     def append_data_file(self, data_file: DataFile) -> _SnapshotProducer[U]:
         self._added_data_files.append(data_file)
+        return self
+
+    def append_delete_file(self, delete_file: DataFile) -> _SnapshotProducer[U]:
+        self._added_delete_files.append(delete_file)
         return self
 
     def delete_data_file(self, data_file: DataFile) -> _SnapshotProducer[U]:
@@ -246,6 +252,30 @@ class _SnapshotProducer(UpdateTableMetadata[U], Generic[U]):
             else:
                 return []
 
+        def _write_added_delete_manifest() -> list[ManifestFile]:
+            if not self._added_delete_files:
+                return []
+
+            manifests = []
+            spec_groups: dict[int, list[DataFile]] = defaultdict(list)
+            for delete_file in self._added_delete_files:
+                spec_groups[delete_file.spec_id].append(delete_file)
+
+            for spec_id, delete_files in spec_groups.items():
+                with self.new_manifest_writer(self.spec(spec_id), content=ManifestContent.DELETES) as writer:
+                    for delete_file in delete_files:
+                        writer.add(
+                            ManifestEntry.from_args(
+                                status=ManifestEntryStatus.ADDED,
+                                snapshot_id=self._snapshot_id,
+                                sequence_number=None,
+                                file_sequence_number=None,
+                                data_file=delete_file,
+                            )
+                        )
+                manifests.append(writer.to_manifest_file())
+            return manifests
+
         def _write_delete_manifest() -> list[ManifestFile]:
             if len(deleted_entries) > 0:
                 deleted_manifests = []
@@ -269,10 +299,13 @@ class _SnapshotProducer(UpdateTableMetadata[U], Generic[U]):
         executor = ExecutorFactory.get_or_create()
 
         added_manifests = executor.submit(_write_added_manifest)
+        added_delete_manifests = executor.submit(_write_added_delete_manifest)
         delete_manifests = executor.submit(_write_delete_manifest)
         existing_manifests = executor.submit(self._existing_manifests)
 
-        return self._process_manifests(added_manifests.result() + delete_manifests.result() + existing_manifests.result())
+        return self._process_manifests(
+            added_manifests.result() + added_delete_manifests.result() + delete_manifests.result() + existing_manifests.result()
+        )
 
     def _summary(self, snapshot_properties: dict[str, str] = EMPTY_DICT) -> Summary:
         from pyiceberg.table import TableProperties
@@ -293,6 +326,15 @@ class _SnapshotProducer(UpdateTableMetadata[U], Generic[U]):
             ssc.add_file(
                 data_file=data_file,
                 partition_spec=default_spec,
+                schema=schema,
+            )
+
+        for delete_file in self._added_delete_files:
+            # A delete file inherits the spec of the data file it applies to, which is not
+            # necessarily the default one
+            ssc.add_file(
+                data_file=delete_file,
+                partition_spec=table_metadata.specs()[delete_file.spec_id],
                 schema=schema,
             )
 
@@ -391,7 +433,7 @@ class _SnapshotProducer(UpdateTableMetadata[U], Generic[U]):
     def spec(self, spec_id: int) -> PartitionSpec:
         return self._transaction.table_metadata.specs()[spec_id]
 
-    def new_manifest_writer(self, spec: PartitionSpec) -> ManifestWriter:
+    def new_manifest_writer(self, spec: PartitionSpec, content: ManifestContent = ManifestContent.DATA) -> ManifestWriter:
         return write_manifest(
             format_version=self._transaction.table_metadata.format_version,
             spec=spec,
@@ -399,6 +441,7 @@ class _SnapshotProducer(UpdateTableMetadata[U], Generic[U]):
             output_file=self.new_manifest_output(),
             snapshot_id=self._snapshot_id,
             avro_compression=self._compression,
+            content=content,
         )
 
     def new_manifest_output(self) -> OutputFile:

@@ -126,6 +126,7 @@ from pyiceberg.io import (
 from pyiceberg.io.fileformat import DataFileStatistics as DataFileStatistics
 from pyiceberg.io.fileformat import FileFormatFactory, FileFormatModel, FileFormatWriter
 from pyiceberg.manifest import (
+    POSITIONAL_DELETE_SCHEMA,
     DataFile,
     DataFileContent,
     FileFormat,
@@ -2958,6 +2959,93 @@ def _get_parquet_writer_kwargs(table_properties: Properties) -> dict[str, Any]:
             default=TableProperties.PARQUET_PAGE_ROW_LIMIT_DEFAULT,
         ),
     }
+
+
+_POSITION_COLUMN_NAME = "__position"
+
+
+def _positions_matching_predicate(
+    io: FileIO,
+    table_metadata: TableMetadata,
+    data_file: DataFile,
+    delete_filter: BooleanExpression,
+    case_sensitive: bool,
+) -> pa.Array:
+    """Return the ordinal row positions in ``data_file`` of the rows that match ``delete_filter``."""
+    from pyiceberg.table import FileScanTask
+
+    schema = table_metadata.schema()
+    bound_delete_filter = bind(schema, delete_filter, case_sensitive)
+
+    # Only the columns that the predicate touches have to be read, the positions are what matters here
+    column_names = [schema.find_column_name(field_id) for field_id in extract_field_ids(bound_delete_filter)]
+    projected_schema = (
+        schema.select(*[name for name in column_names if name is not None], case_sensitive=case_sensitive)
+        if all(name is not None for name in column_names)
+        else schema
+    )
+
+    # The positions are physical, so the deletes of the file are deliberately not applied here:
+    # applying them would shift every position that follows a deleted row
+    rows = ArrowScan(
+        table_metadata=table_metadata,
+        io=io,
+        projected_schema=projected_schema,
+        row_filter=AlwaysTrue(),
+        case_sensitive=case_sensitive,
+    ).to_table(tasks=[FileScanTask(data_file)])
+
+    matched = rows.append_column(_POSITION_COLUMN_NAME, pa.array(range(len(rows)), type=pa.int64())).filter(
+        expression_to_pyarrow(bound_delete_filter, projected_schema)
+    )
+    return matched.column(_POSITION_COLUMN_NAME).combine_chunks()
+
+
+def _write_position_deletes(
+    io: FileIO,
+    table_metadata: TableMetadata,
+    data_file: DataFile,
+    positions: pa.Array,
+    write_uuid: uuid.UUID,
+    counter: itertools.count[int],
+) -> DataFile:
+    """Write the positions of the deleted rows of a single data file to a position delete file."""
+    from pyiceberg.table import TableProperties
+
+    location_provider = load_location_provider(table_location=table_metadata.location, table_properties=table_metadata.properties)
+    file_path = location_provider.new_data_location(f"{write_uuid}-{next(counter)}-deletes.parquet")
+
+    deletes = pa.table(
+        [pa.array([data_file.file_path] * len(positions), type=pa.string()), positions],
+        schema=schema_to_pyarrow(POSITIONAL_DELETE_SCHEMA),
+    )
+
+    # The read side only pins a delete file to a single data file when its `file_path` bounds are
+    # exact, and the default truncating metrics mode would cut them short
+    properties = {
+        **table_metadata.properties,
+        f"{TableProperties.METRICS_MODE_COLUMN_CONF_PREFIX}.file_path": "full",
+    }
+
+    output_file = io.new_output(file_path)
+    with ParquetFormatWriter(output_file, POSITIONAL_DELETE_SCHEMA, properties) as writer:
+        writer.write(deletes)
+
+    delete_file = DataFile.from_args(
+        content=DataFileContent.POSITION_DELETES,
+        file_path=file_path,
+        file_format=FileFormat.PARQUET,
+        # A position delete file lives in the partition of the data file it applies to
+        partition=data_file.partition,
+        file_size_in_bytes=len(output_file),
+        sort_order_id=None,
+        equality_ids=None,
+        key_metadata=None,
+        **writer.result().to_serialized_dict(),
+    )
+    # The spec id is not part of the data file struct, it is tracked by the manifest
+    delete_file.spec_id = data_file.spec_id
+    return delete_file
 
 
 def _dataframe_to_data_files(
