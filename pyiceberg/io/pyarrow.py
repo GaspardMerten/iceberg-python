@@ -2961,9 +2961,6 @@ def _get_parquet_writer_kwargs(table_properties: Properties) -> dict[str, Any]:
     }
 
 
-_POSITION_COLUMN_NAME = "__position"
-
-
 def _positions_matching_predicate(
     io: FileIO,
     table_metadata: TableMetadata,
@@ -2995,10 +2992,15 @@ def _positions_matching_predicate(
         case_sensitive=case_sensitive,
     ).to_table(tasks=[FileScanTask(data_file)])
 
-    matched = rows.append_column(_POSITION_COLUMN_NAME, pa.array(range(len(rows)), type=pa.int64())).filter(
+    # The table can hold a column of any name, so the one carrying the positions has to dodge them
+    position_column = "__position"
+    while position_column in rows.column_names:
+        position_column += "_"
+
+    matched = rows.append_column(position_column, pa.array(range(len(rows)), type=pa.int64())).filter(
         expression_to_pyarrow(bound_delete_filter, projected_schema)
     )
-    return matched.column(_POSITION_COLUMN_NAME).combine_chunks()
+    return matched.column(position_column).combine_chunks()
 
 
 def _write_position_deletes(
@@ -3016,7 +3018,7 @@ def _write_position_deletes(
     file_path = location_provider.new_data_location(f"{write_uuid}-{next(counter)}-deletes.parquet")
 
     deletes = pa.table(
-        [pa.array([data_file.file_path] * len(positions), type=pa.string()), positions],
+        [pa.repeat(pa.scalar(data_file.file_path, type=pa.string()), len(positions)), positions],
         schema=schema_to_pyarrow(POSITIONAL_DELETE_SCHEMA),
     )
 
