@@ -488,6 +488,59 @@ def test_partitioned_table_positional_deletes_sequence_number(spark: SparkSessio
 
 
 @pytest.mark.integration
+def test_merge_on_read_delete_is_readable_by_spark(spark: SparkSession, session_catalog: RestCatalog) -> None:
+    """A delete written as position deletes has to be readable by the engines that already write them."""
+    identifier = "default.table_merge_on_read_delete"
+
+    run_spark_commands(
+        spark,
+        [
+            f"DROP TABLE IF EXISTS {identifier}",
+            f"""
+            CREATE TABLE {identifier} (
+                number_partitioned  int,
+                number              int
+            )
+            USING iceberg
+            PARTITIONED BY (number_partitioned)
+            TBLPROPERTIES(
+                'format-version' = 2,
+                'write.delete.mode'='merge-on-read'
+            )
+        """,
+            f"""
+            INSERT INTO {identifier} VALUES (10, 100), (10, 101), (20, 200), (20, 201)
+        """,
+        ],
+    )
+
+    tbl = session_catalog.load_table(identifier)
+    data_files_before = sorted(task.file.file_path for task in tbl.scan().plan_files())
+    assert len(data_files_before) == 2
+
+    tbl.delete(EqualTo("number", 101))
+
+    # The data files are untouched, the delete is recorded beside them
+    tbl = session_catalog.load_table(identifier)
+    assert sorted(task.file.file_path for task in tbl.scan().plan_files()) == data_files_before
+
+    snapshot = tbl.metadata.current_snapshot()
+    assert snapshot is not None
+    assert snapshot.summary is not None
+    assert snapshot.summary.operation == Operation.OVERWRITE
+    assert snapshot.summary["added-position-deletes"] == "1"
+    assert snapshot.summary["added-position-delete-files"] == "1"
+    assert ManifestContent.DELETES in [manifest.content for manifest in snapshot.manifests(tbl.io)]
+
+    expected = [(10, 100), (20, 200), (20, 201)]
+    assert sorted(tbl.scan().to_arrow().to_pylist(), key=lambda row: (row["number_partitioned"], row["number"])) == [
+        {"number_partitioned": partitioned, "number": number} for partitioned, number in expected
+    ]
+    # And Spark, reading the position delete PyIceberg wrote, agrees
+    assert sorted((row.number_partitioned, row.number) for row in spark.sql(f"SELECT * FROM {identifier}").collect()) == expected
+
+
+@pytest.mark.integration
 def test_delete_no_match(session_catalog: RestCatalog) -> None:
     arrow_schema = pa.schema([pa.field("ints", pa.int32())])
     arrow_tbl = pa.Table.from_pylist(
