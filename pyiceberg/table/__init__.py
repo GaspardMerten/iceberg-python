@@ -802,7 +802,7 @@ class Transaction:
                     _write_position_deletes(
                         io=self._table.io,
                         table_metadata=self.table_metadata,
-                        data_files=[task.file for task in files],
+                        tasks=files,
                         delete_filter=delete_filter,
                         case_sensitive=case_sensitive,
                         write_uuid=commit_uuid,

@@ -151,6 +151,45 @@ def test_successive_deletes_accumulate(catalog: Catalog) -> None:
     )
 
 
+def test_delete_does_not_record_a_position_twice(catalog: Catalog) -> None:
+    """Re-deleting a row an earlier delete file covers would pile another copy of its position up."""
+    import pyarrow.parquet as pq
+
+    table = _create_table(catalog, "default.test_merge_on_read_no_double_delete")
+
+    table.delete("id >= 4")
+    table.delete("id >= 3")
+
+    delete_files = _data_files(table, DataFileContent.POSITION_DELETES)
+    recorded = sorted(pq.read_table(file.file_path).column("pos").to_pylist() for file in delete_files)
+    assert recorded == [[2], [3, 4]]
+
+    assert table.scan().to_arrow() == pa.Table.from_pylist(
+        [{"id": row, "name": f"name-{row}"} for row in [1, 2]],
+        schema=SCHEMA,
+    )
+
+
+def test_overwriting_the_same_row_keeps_one_delete_file(catalog: Catalog) -> None:
+    """The incremental-sink case: re-syncing the same key must not grow the delete files."""
+    table = _create_table(catalog, "default.test_merge_on_read_repeated_overwrite")
+
+    for tick in range(5):
+        table.overwrite(
+            pa.Table.from_pylist([{"id": 3, "name": f"tick-{tick}"}], schema=SCHEMA),
+            overwrite_filter="id = 3",
+        )
+
+    assert len(_data_files(table, DataFileContent.POSITION_DELETES)) == 1
+    assert table.scan().to_arrow().sort_by("id").column("name").to_pylist() == [
+        "name-1",
+        "name-2",
+        "tick-4",
+        "name-4",
+        "name-5",
+    ]
+
+
 def test_delete_of_a_whole_file_drops_the_file(catalog: Catalog) -> None:
     """A file that matches entirely is still dropped outright, no delete file is needed."""
     table = _create_table(catalog, "default.test_merge_on_read_whole_file")

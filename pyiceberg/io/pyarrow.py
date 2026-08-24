@@ -2964,7 +2964,7 @@ def _get_parquet_writer_kwargs(table_properties: Properties) -> dict[str, Any]:
 def _write_position_deletes(
     io: FileIO,
     table_metadata: TableMetadata,
-    data_files: Iterable[DataFile],
+    tasks: Iterable[FileScanTask],
     delete_filter: BooleanExpression,
     case_sensitive: bool,
     write_uuid: uuid.UUID,
@@ -2972,7 +2972,8 @@ def _write_position_deletes(
 ) -> Iterator[DataFile]:
     """Write the positions of the rows matching ``delete_filter`` to one position delete file per data file.
 
-    A data file none of whose rows match is skipped, so it yields at most one file per input.
+    A data file whose matching rows are all deleted already is skipped, so it yields at most one
+    file per task.
     """
     from pyiceberg.table import FileScanTask, TableProperties
 
@@ -2998,7 +2999,7 @@ def _write_position_deletes(
         f"{TableProperties.METRICS_MODE_COLUMN_CONF_PREFIX}.file_path": "full",
     }
 
-    def _matching_positions(data_file: DataFile) -> pa.Array:
+    def _matching_positions(task: FileScanTask) -> pa.Array:
         # The positions are physical, so the deletes of the file are deliberately not applied here:
         # applying them would shift every position that follows a deleted row
         rows = ArrowScan(
@@ -3007,15 +3008,30 @@ def _write_position_deletes(
             projected_schema=projected_schema,
             row_filter=AlwaysTrue(),
             case_sensitive=case_sensitive,
-        ).to_table(tasks=[FileScanTask(data_file)])
+        ).to_table(tasks=[FileScanTask(task.file)])
 
         # Projecting the predicate yields the matches as a mask, whose set positions are the ones
         # to record. A single threaded scan keeps them in the order of the file.
         mask = ds.dataset(rows).to_table(columns={"matched": matches}, use_threads=False).column("matched")
         # The positions are typed by POSITIONAL_DELETE_SCHEMA when the delete file is built
-        return pc.indices_nonzero(mask)
+        positions = pc.indices_nonzero(mask)
+
+        # A row an earlier delete file already covers does not have to be recorded again, otherwise
+        # every delete of the same rows piles another copy of their positions up
+        already_deleted = [
+            (arr.combine_chunks() if isinstance(arr, pa.ChunkedArray) else arr).cast(positions.type)
+            for arr in deletes_per_file.get(task.file.file_path, [])
+        ]
+        if already_deleted:
+            positions = positions.filter(pc.invert(pc.is_in(positions, value_set=pa.concat_arrays(already_deleted))))
+
+        return positions
 
     def _write(data_file: DataFile, positions: pa.Array) -> DataFile:
+        # The delete file lands in the data location of the table rather than the directory of the
+        # partition it belongs to: `new_data_location` takes the untransformed values of a partition
+        # key, and the record of a data file holds them transformed already. The manifest records
+        # the partition, so the metadata is unaffected either way.
         file_path = location_provider.new_data_location(f"{write_uuid}-{next(counter)}-deletes.parquet")
         deletes = pa.table(
             [pa.repeat(pa.scalar(data_file.file_path, type=pa.string()), len(positions)), positions],
@@ -3042,9 +3058,12 @@ def _write_position_deletes(
         delete_file.spec_id = data_file.spec_id
         return delete_file
 
-    for data_file in data_files:
-        if len(positions := _matching_positions(data_file)) > 0:
-            yield _write(data_file, positions)
+    tasks = list(tasks)
+    deletes_per_file = _read_all_delete_files(io, tasks)
+
+    for task in tasks:
+        if len(positions := _matching_positions(task)) > 0:
+            yield _write(task.file, positions)
 
 
 def _dataframe_to_data_files(
