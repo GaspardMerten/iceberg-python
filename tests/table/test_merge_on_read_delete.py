@@ -376,3 +376,19 @@ def test_concurrent_deletes_of_the_same_partition_conflict(catalog: Catalog) -> 
 
     with pytest.raises(ValidationException):
         second.delete("id = 2")
+
+
+def test_a_delete_matching_nothing_does_not_conflict(catalog: Catalog) -> None:
+    """Matching no row at all is an answer: the delete bears on no partition, so nothing clashes."""
+    identifier = "default.test_merge_on_read_no_match_no_conflict"
+    _partitioned_table(catalog, identifier)
+
+    first = catalog.load_table(identifier)
+    second = catalog.load_table(identifier)
+
+    first.delete("id = 1")
+
+    with pytest.warns(UserWarning, match="did not match any records"):
+        second.delete("id = 999")
+
+    assert catalog.load_table(identifier).scan().to_arrow().sort_by("id").column("id").to_pylist() == [2, 3, 4]

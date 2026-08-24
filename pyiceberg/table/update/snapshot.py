@@ -576,7 +576,10 @@ class _SnapshotProducer(UpdateTableMetadata[U], Generic[U]):
                 if matches(entry.data_file) is not ROWS_CANNOT_MATCH:
                     partitions[entry.data_file.spec_id].add(entry.data_file.partition)
 
-        return dict(partitions) or None
+        # An empty mapping is an answer of its own: the operation bears on no partition at all,
+        # so nothing committed concurrently can conflict with it. Only an unknown starting point
+        # leaves the check unscoped.
+        return dict(partitions)
 
     def _build_partition_projection(self, spec_id: int) -> BooleanExpression:
         project = inclusive_projection(self.schema(), self.spec(spec_id), self._case_sensitive)
