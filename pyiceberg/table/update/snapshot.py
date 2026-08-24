@@ -31,6 +31,7 @@ from pyiceberg.avro.codecs import AvroCompressionCodec
 from pyiceberg.exceptions import ValidationException
 from pyiceberg.expressions import AlwaysFalse, BooleanExpression, Or
 from pyiceberg.expressions.visitors import (
+    ROWS_CANNOT_MATCH,
     ROWS_MIGHT_NOT_MATCH,
     ROWS_MUST_MATCH,
     _InclusiveMetricsEvaluator,
@@ -538,10 +539,9 @@ class _SnapshotProducer(UpdateTableMetadata[U], Generic[U]):
             _validate_added_data_files(table, catalog_head, conflict_detection_filter, starting_snapshot)
 
         if self._predicate != AlwaysFalse():
-            # partition_set is None, so any concurrently committed delete file counts as
-            # a conflict even in unrelated partitions. Scope this via partition projection
-            # (as Java does) when delete-file write support lands.
-            _validate_no_new_delete_files(table, catalog_head, conflict_detection_filter, None, starting_snapshot)
+            _validate_no_new_delete_files(
+                table, catalog_head, conflict_detection_filter, self._conflicting_partitions(), starting_snapshot
+            )
             _validate_deleted_data_files(table, catalog_head, conflict_detection_filter, starting_snapshot)
 
         if self._deleted_data_files:
@@ -549,6 +549,34 @@ class _SnapshotProducer(UpdateTableMetadata[U], Generic[U]):
             _validate_no_new_deletes_for_data_files(
                 table, catalog_head, conflict_detection_filter, self._deleted_data_files, starting_snapshot
             )
+
+    def _conflicting_partitions(self) -> dict[int, set[Record]] | None:
+        """Return the partitions this operation bears on, or None when they cannot be determined.
+
+        A delete file committed concurrently in a partition this operation does not touch cannot
+        apply to any of its rows, so it is no conflict. Without this the metrics of a delete file,
+        which hold no statistic of the columns of the table, match every predicate.
+        """
+        snapshot = (
+            self._transaction.table_metadata.snapshot_by_id(self._starting_snapshot_id)
+            if self._starting_snapshot_id is not None
+            else None
+        )
+        if snapshot is None:
+            return None
+
+        manifest_evaluators: dict[int, Callable[[ManifestFile], bool]] = KeyDefaultDict(self._build_manifest_evaluator)
+        matches = _InclusiveMetricsEvaluator(self.schema(), self._predicate, case_sensitive=self._case_sensitive).eval
+
+        partitions: dict[int, set[Record]] = defaultdict(set)
+        for manifest in snapshot.manifests(io=self._io):
+            if manifest.content != ManifestContent.DATA or not manifest_evaluators[manifest.partition_spec_id](manifest):
+                continue
+            for entry in manifest.fetch_manifest_entry(io=self._io, discard_deleted=True):
+                if matches(entry.data_file) is not ROWS_CANNOT_MATCH:
+                    partitions[entry.data_file.spec_id].add(entry.data_file.partition)
+
+        return dict(partitions) or None
 
     def _build_partition_projection(self, spec_id: int) -> BooleanExpression:
         project = inclusive_projection(self.schema(), self.spec(spec_id), self._case_sensitive)

@@ -2984,7 +2984,7 @@ def _write_position_deletes(
     column_names = [schema.find_column_name(field_id) for field_id in extract_field_ids(bound_delete_filter)]
     projected_schema = (
         schema.select(*[name for name in column_names if name is not None], case_sensitive=case_sensitive)
-        if all(name is not None for name in column_names)
+        if column_names and all(name is not None for name in column_names)
         else schema
     )
 

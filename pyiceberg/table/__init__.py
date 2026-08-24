@@ -823,6 +823,11 @@ class Transaction:
                         overwrite_snapshot.delete_by_predicate(delete_filter, case_sensitive)
                         for delete_file in delete_files:
                             overwrite_snapshot.append_delete_file(delete_file)
+                elif _isolation_operation is None:
+                    # Every matching row is covered by a delete file already, so nothing is left to
+                    # record and no snapshot is produced. An overwrite says nothing here, its append
+                    # carries the operation.
+                    warnings.warn("Delete operation did not match any records", stacklevel=2)
                 return
 
             bound_delete_filter = bind(self.table_metadata.schema(), delete_filter, case_sensitive)

@@ -775,7 +775,10 @@ MANIFEST_LIST_FILE_SCHEMAS: dict[int, Schema] = {
 MANIFEST_LIST_FILE_STRUCTS = {format_version: schema.as_struct() for format_version, schema in MANIFEST_LIST_FILE_SCHEMAS.items()}
 
 
-POSITIONAL_DELETE_SCHEMA = Schema(NestedField(2147483546, "file_path", StringType()), NestedField(2147483545, "pos", LongType()))
+POSITIONAL_DELETE_SCHEMA = Schema(
+    NestedField(2147483546, "file_path", StringType(), required=True),
+    NestedField(2147483545, "pos", LongType(), required=True),
+)
 
 
 class ManifestFile(Record):

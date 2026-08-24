@@ -21,6 +21,7 @@ import pyarrow as pa
 import pytest
 
 from pyiceberg.catalog import Catalog
+from pyiceberg.exceptions import ValidationException
 from pyiceberg.manifest import POSITIONAL_DELETE_SCHEMA, DataFile, DataFileContent, ManifestContent
 from pyiceberg.table import Table, TableProperties
 from pyiceberg.table.delete_file_index import PATH_FIELD_ID
@@ -190,6 +191,18 @@ def test_overwriting_the_same_row_keeps_one_delete_file(catalog: Catalog) -> Non
     ]
 
 
+def test_repeating_a_delete_warns_like_copy_on_write(catalog: Catalog) -> None:
+    """The second delete has nothing left to record, and says so rather than passing silently."""
+    table = _create_table(catalog, "default.test_merge_on_read_repeat_warns")
+
+    table.delete("id = 3")
+
+    with pytest.warns(UserWarning, match="did not match any records"):
+        table.delete("id = 3")
+
+    assert len(_data_files(table, DataFileContent.POSITION_DELETES)) == 1
+
+
 def test_delete_of_a_whole_file_drops_the_file(catalog: Catalog) -> None:
     """A file that matches entirely is still dropped outright, no delete file is needed."""
     table = _create_table(catalog, "default.test_merge_on_read_whole_file")
@@ -317,3 +330,49 @@ def test_delete_on_a_table_holding_the_helper_names(catalog: Catalog) -> None:
         [{"id": row, "matched": f"m{row}", "__position": row * 10} for row in [1, 4]],
         schema=schema,
     )
+
+
+def _partitioned_table(catalog: Catalog, identifier: str) -> Table:
+    table = catalog.create_table(
+        identifier,
+        SCHEMA,
+        properties={"format-version": "2", TableProperties.DELETE_MODE: TableProperties.DELETE_MODE_MERGE_ON_READ},
+    )
+    with table.update_spec() as update_spec:
+        update_spec.add_identity("name")
+    table.append(
+        pa.Table.from_pylist(
+            [{"id": 1, "name": "a"}, {"id": 2, "name": "a"}, {"id": 3, "name": "b"}, {"id": 4, "name": "b"}],
+            schema=SCHEMA,
+        )
+    )
+    return table
+
+
+def test_concurrent_deletes_of_separate_partitions(catalog: Catalog) -> None:
+    """A delete file only bears on its own partitions, one committed elsewhere is no conflict."""
+    identifier = "default.test_merge_on_read_concurrent_partitions"
+    _partitioned_table(catalog, identifier)
+
+    first = catalog.load_table(identifier)
+    second = catalog.load_table(identifier)
+
+    first.delete("id = 1")
+    second.delete("id = 3")
+
+    assert len(_data_files(catalog.load_table(identifier), DataFileContent.POSITION_DELETES)) == 2
+    assert catalog.load_table(identifier).scan().to_arrow().sort_by("id").column("id").to_pylist() == [2, 4]
+
+
+def test_concurrent_deletes_of_the_same_partition_conflict(catalog: Catalog) -> None:
+    """Two delete files over one partition still have to be caught."""
+    identifier = "default.test_merge_on_read_concurrent_same_partition"
+    _partitioned_table(catalog, identifier)
+
+    first = catalog.load_table(identifier)
+    second = catalog.load_table(identifier)
+
+    first.delete("id = 1")
+
+    with pytest.raises(ValidationException):
+        second.delete("id = 2")
