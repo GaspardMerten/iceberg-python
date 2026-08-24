@@ -761,7 +761,6 @@ class Transaction:
             ArrowScan,
             _dataframe_to_data_files,
             _expression_to_complementary_pyarrow,
-            _positions_matching_predicate,
             _write_position_deletes,
         )
 
@@ -799,26 +798,17 @@ class Transaction:
             if merge_on_read:
                 # Rather than rewriting the data files without the matched rows, record the positions
                 # of those rows in a delete file that the read side applies
-                delete_files = []
-                for original_file in files:
-                    positions = _positions_matching_predicate(
+                delete_files = list(
+                    _write_position_deletes(
                         io=self._table.io,
                         table_metadata=self.table_metadata,
-                        data_file=original_file.file,
+                        data_files=[task.file for task in files],
                         delete_filter=delete_filter,
                         case_sensitive=case_sensitive,
+                        write_uuid=commit_uuid,
+                        counter=counter,
                     )
-                    if len(positions) > 0:
-                        delete_files.append(
-                            _write_position_deletes(
-                                io=self._table.io,
-                                table_metadata=self.table_metadata,
-                                data_file=original_file.file,
-                                positions=positions,
-                                write_uuid=commit_uuid,
-                                counter=counter,
-                            )
-                        )
+                )
 
                 if delete_files:
                     with self.update_snapshot(
@@ -2708,8 +2698,9 @@ class IncrementalAppendScan(BaseScan):
             options=self.options,
         ).plan_files(
             manifests=manifests,
-            manifest_entry_filter=lambda manifest_entry: manifest_entry.snapshot_id in append_snapshot_ids
-            and manifest_entry.status == ManifestEntryStatus.ADDED,
+            manifest_entry_filter=lambda manifest_entry: (
+                manifest_entry.snapshot_id in append_snapshot_ids and manifest_entry.status == ManifestEntryStatus.ADDED
+            ),
         )
 
     def to_arrow(self) -> pa.Table:

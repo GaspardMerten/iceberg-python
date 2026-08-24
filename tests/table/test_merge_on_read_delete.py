@@ -124,6 +124,20 @@ def test_position_delete_file_has_exact_path_bounds(catalog: Catalog) -> None:
     assert delete_file.upper_bounds[PATH_FIELD_ID].decode("utf-8") == data_file.file_path
 
 
+def test_position_delete_file_types_pos_as_a_long(catalog: Catalog) -> None:
+    """The spec types `pos` as a long, and the delete file has to be written that way."""
+    import pyarrow.parquet as pq
+
+    table = _create_table(catalog, "default.test_merge_on_read_pos_type")
+
+    table.delete("id = 3")
+
+    (delete_file,) = _data_files(table, DataFileContent.POSITION_DELETES)
+    written = pq.read_table(delete_file.file_path)
+    assert written.schema.field("pos").type == pa.int64()
+    assert written.column("pos").to_pylist() == [2]
+
+
 def test_successive_deletes_accumulate(catalog: Catalog) -> None:
     table = _create_table(catalog, "default.test_merge_on_read_successive")
 
