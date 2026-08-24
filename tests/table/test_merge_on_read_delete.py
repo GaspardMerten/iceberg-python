@@ -294,20 +294,26 @@ def test_overwrite_does_not_rewrite_the_data_files(catalog: Catalog) -> None:
     )
 
 
-def test_delete_on_a_column_named_like_the_position_helper(catalog: Catalog) -> None:
-    """The positions are carried in a helper column, which must not collide with a real one."""
-    identifier = "default.test_merge_on_read_position_column"
-    schema = pa.schema([("id", pa.int32()), ("__position", pa.int32())])
+def test_delete_on_a_table_holding_the_helper_names(catalog: Catalog) -> None:
+    """Resolving the positions must not trip over a column named like the ones it uses itself."""
+    identifier = "default.test_merge_on_read_helper_names"
+    schema = pa.schema([("id", pa.int32()), ("matched", pa.string()), ("__position", pa.int32())])
     table = catalog.create_table(
         identifier,
         schema,
         properties={"format-version": "2", TableProperties.DELETE_MODE: TableProperties.DELETE_MODE_MERGE_ON_READ},
     )
-    table.append(pa.Table.from_pylist([{"id": row, "__position": row * 10} for row in range(1, 5)], schema=schema))
+    table.append(
+        pa.Table.from_pylist(
+            [{"id": row, "matched": f"m{row}", "__position": row * 10} for row in range(1, 5)],
+            schema=schema,
+        )
+    )
 
     table.delete("__position = 30")
+    table.delete("matched = 'm2'")
 
     assert table.scan().to_arrow() == pa.Table.from_pylist(
-        [{"id": row, "__position": row * 10} for row in [1, 2, 4]],
+        [{"id": row, "matched": f"m{row}", "__position": row * 10} for row in [1, 4]],
         schema=schema,
     )

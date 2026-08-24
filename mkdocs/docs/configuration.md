@@ -123,7 +123,7 @@ When a concurrent commit is detected, PyIceberg automatically retries the operat
 
 | Key                 | Options                          | Default        | Description                                                                                     |
 | ------------------- | -------------------------------- | -------------- | ----------------------------------------------------------------------------------------------- |
-| `write.delete.mode` | `{copy-on-write,merge-on-read}`  | copy-on-write  | How a delete removes rows. Under `copy-on-write`, every data file holding a matched row is rewritten without those rows. Under `merge-on-read`, the data files are left untouched and the matched row positions are written to a position delete file that readers apply, which costs O(rows deleted) instead of O(table). Merge-on-read is only available on v2 tables; v1 and v3 tables fall back to copy-on-write. |
+| `write.delete.mode` | `{copy-on-write,merge-on-read}`  | copy-on-write  | How a delete removes rows. Under `copy-on-write`, every data file holding a matched row is rewritten without those rows. Under `merge-on-read`, the data files are left untouched and the matched row positions are written to a position delete file that readers apply. The data files that hold a matched row are still read to locate the rows, but only the positions are written, instead of a new copy of every one of those files. Merge-on-read is only available on v2 tables; v1 and v3 tables fall back to copy-on-write. |
 
 ### Isolation level options
 
