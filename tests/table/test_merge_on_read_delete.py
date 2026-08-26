@@ -22,11 +22,10 @@ import pytest
 
 from pyiceberg.catalog import Catalog
 from pyiceberg.exceptions import ValidationException
-from pyiceberg.manifest import POSITIONAL_DELETE_SCHEMA, DataFile, DataFileContent, ManifestContent
+from pyiceberg.manifest import DataFile, DataFileContent, ManifestContent
 from pyiceberg.table import Table, TableProperties
 from pyiceberg.table.delete_file_index import PATH_FIELD_ID
 from pyiceberg.table.snapshots import ADDED_POSITION_DELETE_FILES, ADDED_POSITION_DELETES, Operation
-from pyiceberg.types import LongType
 from tests.catalog.test_base import InMemoryCatalog
 
 SCHEMA = pa.schema([("id", pa.int32()), ("name", pa.string())])
@@ -63,11 +62,6 @@ def _data_files(table: Table, content: DataFileContent) -> list[DataFile]:
         for entry in manifest.fetch_manifest_entry(table.io, discard_deleted=True)
         if entry.data_file.content == content
     ]
-
-
-def test_position_delete_schema_types_pos_as_long() -> None:
-    """The spec types `pos` as a long, an int overflows on files with more than 2^31 rows."""
-    assert POSITIONAL_DELETE_SCHEMA.find_field("pos").field_type == LongType()
 
 
 def test_delete_writes_position_deletes_instead_of_rewriting(catalog: Catalog) -> None:
@@ -125,8 +119,8 @@ def test_position_delete_file_has_exact_path_bounds(catalog: Catalog) -> None:
     assert delete_file.upper_bounds[PATH_FIELD_ID].decode("utf-8") == data_file.file_path
 
 
-def test_position_delete_file_types_pos_as_a_long(catalog: Catalog) -> None:
-    """The spec types `pos` as a long, and the delete file has to be written that way."""
+def test_position_delete_file_follows_the_spec(catalog: Catalog) -> None:
+    """The spec types `pos` as a long, an int overflows past 2^31 rows, and requires both fields."""
     import pyarrow.parquet as pq
 
     table = _create_table(catalog, "default.test_merge_on_read_pos_type")
@@ -136,6 +130,8 @@ def test_position_delete_file_types_pos_as_a_long(catalog: Catalog) -> None:
     (delete_file,) = _data_files(table, DataFileContent.POSITION_DELETES)
     written = pq.read_table(delete_file.file_path)
     assert written.schema.field("pos").type == pa.int64()
+    assert not written.schema.field("pos").nullable
+    assert not written.schema.field("file_path").nullable
     assert written.column("pos").to_pylist() == [2]
 
 
